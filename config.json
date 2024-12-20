@@ -1,0 +1,11 @@
+{
+    "fonts_dir": "fonts",
+    "background_image": "draft_paper.png",
+    "output_dir": "output",
+    "font_size": 30,
+    "text_color": [0, 0, 0],
+    "start_x": 100,
+    "start_y": 100,
+    "line_spacing": 40,
+    "chars_per_line": 30
+}

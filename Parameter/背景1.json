@@ -1,0 +1,15 @@
+{
+        "font_size":100,
+        "line_spacing":143,
+        "left_margin":180,
+        "top_margin":140,
+        "right_margin":100,
+        "bottom_margin":70,
+        "word_spacing":5,
+        "line_spacing_sigma":0,
+        "font_size_sigma":2,  
+        "word_spacing_sigma":2, 
+        "perturb_x_sigma":3,  
+        "perturb_y_sigma":3,  
+        "perturb_theta_sigma":0.05  
+}
