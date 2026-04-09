@@ -1,16 +1,184 @@
 from PIL import Image, ImageDraw, ImageFont
 import docx2txt
-import textwrap
 import os
 import random
 import json
-from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel,
                             QFileDialog, QVBoxLayout, QHBoxLayout, QWidget, 
                             QProgressBar, QMessageBox, QLineEdit, QSpinBox,
                             QComboBox, QDoubleSpinBox, QGridLayout)  
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QDragEnterEvent, QDropEvent
+
+_MEASURE_DRAW = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+
+def load_font(font_path, font_size):
+    return ImageFont.truetype(font_path, max(1, int(round(font_size))))
+
+
+def normalize_content(content):
+    return content.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def read_text_from_file(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"找不到文件: {file_path}")
+
+    file_ext = os.path.splitext(file_path)[1].lower()
+    if file_ext == '.txt':
+        for encoding in ('utf-8', 'utf-8-sig', 'gb18030', 'gbk'):
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+
+    if file_ext in ['.docx', '.doc']:
+        return docx2txt.process(file_path)
+
+    raise ValueError(f"不支持的文件格式: {file_ext}")
+
+
+def get_text_color(params):
+    return tuple(params.get('text_color', (0, 0, 0)))
+
+
+def get_line_height(font, params):
+    bbox = _MEASURE_DRAW.textbbox((0, 0), "Hg中", font=font)
+    glyph_height = max(1, bbox[3] - bbox[1])
+    perturb_y = max(0.0, float(params.get('perturb_y_sigma', 0)))
+    return glyph_height + perturb_y * 2
+
+
+def wrap_text_to_lines(text, font, max_width, char_spacing):
+    if text == "":
+        return []
+
+    lines = []
+    current_chars = []
+    current_width = 0.0
+
+    for char in text:
+        char_width = _MEASURE_DRAW.textlength(char, font=font)
+        added_width = char_width if not current_chars else char_width + char_spacing
+
+        if current_chars and current_width + added_width > max_width:
+            lines.append("".join(current_chars))
+            current_chars = [char]
+            current_width = char_width
+            continue
+
+        if current_chars:
+            current_width += char_spacing
+        current_chars.append(char)
+        current_width += char_width
+
+    if current_chars:
+        lines.append("".join(current_chars))
+
+    return lines
+
+
+def paginate_content(content, page_size, params, font):
+    page_width, page_height = page_size
+    left_margin = float(params['left_margin'])
+    right_margin = float(params['right_margin'])
+    top_margin = float(params['top_margin'])
+    bottom_margin = float(params['bottom_margin'])
+    line_step = max(1.0, float(params['line_spacing']))
+    char_spacing = max(0.0, float(params.get('word_spacing', 0)))
+    perturb_x = max(0.0, float(params.get('perturb_x_sigma', 0)))
+    max_width = page_width - left_margin - right_margin - perturb_x * 2
+
+    if max_width <= 0:
+        raise ValueError("左右边距过大，当前页面没有可用的书写宽度。")
+
+    line_height = get_line_height(font, params)
+    bottom_limit = page_height - bottom_margin
+    if top_margin + line_height > bottom_limit:
+        raise ValueError("上下边距过大，当前页面没有可用的书写高度。")
+
+    pages = []
+    current_page = []
+    current_y = top_margin
+    raw_lines = normalize_content(content).split('\n')
+
+    if not raw_lines:
+        raw_lines = [""]
+
+    def start_new_page():
+        nonlocal current_page, current_y
+        pages.append(current_page)
+        current_page = []
+        current_y = top_margin
+
+    for raw_line in raw_lines:
+        if raw_line == "":
+            if current_y + line_height > bottom_limit and current_page:
+                start_new_page()
+
+            current_y += line_step
+            continue
+
+        wrapped_lines = wrap_text_to_lines(raw_line, font, max_width, char_spacing)
+
+        for line in wrapped_lines:
+            if current_y + line_height > bottom_limit and current_page:
+                start_new_page()
+            current_page.append({
+                'text': line,
+                'y': current_y,
+            })
+            current_y += line_step
+
+    if current_page or not pages:
+        pages.append(current_page)
+
+    return pages
+
+
+def draw_text_line(draw, font, params, text, x, y, scale=1.0, jitter=False):
+    fill = get_text_color(params)
+    word_spacing = float(params.get('word_spacing', 0)) * scale
+    word_spacing_sigma = float(params.get('word_spacing_sigma', 0)) * scale if jitter else 0.0
+    perturb_x_sigma = float(params.get('perturb_x_sigma', 0)) * scale if jitter else 0.0
+    perturb_y_sigma = float(params.get('perturb_y_sigma', 0)) * scale if jitter else 0.0
+
+    for index, char in enumerate(text):
+        dx = random.gauss(0, perturb_x_sigma) if perturb_x_sigma else 0.0
+        dy = random.gauss(0, perturb_y_sigma) if perturb_y_sigma else 0.0
+
+        draw.text((x + dx, y + dy), char, font=font, fill=fill)
+
+        if index >= len(text) - 1:
+            continue
+
+        char_width = draw.textlength(char, font=font)
+        spacing_jitter = random.gauss(0, word_spacing_sigma) if word_spacing_sigma else 0.0
+        x += char_width + word_spacing + spacing_jitter
+
+
+def render_page(background, font, params, page_layout, scale=1.0, jitter=False):
+    draw = ImageDraw.Draw(background)
+    left_margin = float(params['left_margin']) * scale
+
+    for line in page_layout:
+        draw_text_line(
+            draw=draw,
+            font=font,
+            params=params,
+            text=line['text'],
+            x=left_margin,
+            y=float(line['y']) * scale,
+            scale=scale,
+            jitter=jitter,
+        )
+
+    return background
 
 class StyleSheet:
     """样式表"""
@@ -175,8 +343,15 @@ class PreviewWidget(QLabel):
             preview_height = int(background.height * ratio)
             background = background.resize((preview_width, preview_height))
             
-            draw = ImageDraw.Draw(background)
-            font = ImageFont.truetype(font_path, int(params['font_size'] * ratio))
+            font = load_font(font_path, params['font_size'] * ratio)
+            render_page(
+                background=background,
+                font=font,
+                params=params,
+                page_layout=params.get('page_layout', []),
+                scale=ratio,
+                jitter=False,
+            )
             
             # 使用参数中的预览文本
             preview_text = params.get('preview_text', "预览文本\n第二行文本")
@@ -189,7 +364,7 @@ class PreviewWidget(QLabel):
             x += random.gauss(0, params['perturb_x_sigma'] * ratio)
             y += random.gauss(0, params['perturb_y_sigma'] * ratio)
             
-            draw.text((x, y), preview_text, font=font, fill=(0, 0, 0))
+            pass
             
             # 转换为QPixmap并显示
             img = background.convert('RGB')
@@ -203,6 +378,32 @@ class PreviewWidget(QLabel):
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+
+    def update_preview(self, background_path, font_path, params):
+        try:
+            background = Image.open(background_path)
+            preview_width = 400
+            ratio = preview_width / background.width
+            preview_height = int(background.height * ratio)
+            background = background.resize((preview_width, preview_height))
+
+            font = load_font(font_path, params['font_size'] * ratio)
+            render_page(
+                background=background,
+                font=font,
+                params=params,
+                page_layout=params.get('page_layout', []),
+                scale=ratio,
+                jitter=False,
+            )
+
+            img = background.convert('RGB')
+            data = img.tobytes("raw", "RGB")
+            qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg)
+            self.setPixmap(pixmap)
+        except Exception as e:
+            self.setText(f"预览失败: {str(e)}")
 
     def dropEvent(self, event: QDropEvent):
         files = [u.toLocalFile() for u in event.mimeData().urls()]
@@ -335,10 +536,57 @@ class HandwritingConverter(QThread):
         """停止转换"""
         self.is_running = False
 
+    def run(self):
+        try:
+            self.progress.emit(10, "正在读取文件...")
+            text_content = self.read_text_from_file(self.input_file)
+
+            output_base = os.path.join(
+                self.output_dir,
+                f"handwritten_{os.path.splitext(os.path.basename(self.input_file))[0]}"
+            )
+            os.makedirs(output_base, exist_ok=True)
+
+            self.progress.emit(20, "正在排版...")
+            background_template = Image.open(self.params['background_path'])
+            font = load_font(self.params['font_path'], self.params['font_size'])
+            pages = paginate_content(
+                content=text_content,
+                page_size=background_template.size,
+                params=self.params,
+                font=font,
+            )
+
+            total_pages = len(pages)
+            for page_index, page_layout in enumerate(pages, start=1):
+                if not self.is_running:
+                    raise InterruptedError("转换已取消")
+
+                background = Image.open(self.params['background_path'])
+                render_page(background, font, self.params, page_layout, jitter=True)
+
+                output_path = os.path.join(output_base, f"page_{page_index:03d}.png")
+                background.save(output_path)
+
+                progress = 20 + int(page_index / max(total_pages, 1) * 70)
+                self.progress.emit(progress, f"正在生成第 {page_index}/{total_pages} 页...")
+
+            self.progress.emit(100, "转换完成")
+            self.finished.emit(True, f"转换完成，共生成 {total_pages} 页")
+        except InterruptedError as e:
+            self.finished.emit(False, str(e))
+        except Exception as e:
+            self.finished.emit(False, f"错误: {str(e)}")
+
+    def read_text_from_file(self, file_path):
+        return read_text_from_file(file_path)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.converter = None
+        self.preview_pages = []
+        self.current_preview_page = 0
         self.preview_pages = []  # 存储预览页面的内容
         self.current_preview_page = 0  # 当前预览页码
         self.initUI()
@@ -563,6 +811,14 @@ class MainWindow(QMainWindow):
         self.font_combo.currentIndexChanged.connect(self.update_preview)
         self.bg_combo.currentIndexChanged.connect(self.update_preview)
         self.font_size_spin.valueChanged.connect(self.update_preview)
+        self.line_spacing_spin.valueChanged.connect(self.update_preview)
+        self.word_spacing_spin.valueChanged.connect(self.update_preview)
+        self.left_margin_spin.valueChanged.connect(self.update_preview)
+        self.right_margin_spin.valueChanged.connect(self.update_preview)
+        self.top_margin_spin.valueChanged.connect(self.update_preview)
+        self.bottom_margin_spin.valueChanged.connect(self.update_preview)
+        self.perturb_x_spin.valueChanged.connect(self.update_preview)
+        self.perturb_y_spin.valueChanged.connect(self.update_preview)
         
         # 设置布局比例
         main_layout.setStretch(0, 1)  # 控制面板
@@ -873,6 +1129,58 @@ class MainWindow(QMainWindow):
             self.current_preview_page += 1
             self.show_current_preview_page()
             self.update_page_controls()
+    def update_preview(self):
+        if not self.bg_combo.currentData() or not self.font_combo.currentData():
+            return
+
+        try:
+            content = "预览文本\n第二行文本"
+            if self.input_path.text() and os.path.exists(self.input_path.text()):
+                content = read_text_from_file(self.input_path.text())
+
+            self.preview_pages = self.split_content_to_pages(content)
+            self.current_preview_page = 0
+            self.update_page_controls()
+            self.show_current_preview_page()
+        except Exception as e:
+            QMessageBox.warning(self, "预览失败", str(e))
+
+    def split_content_to_pages(self, content):
+        params = self.get_current_params()
+        background = Image.open(self.bg_combo.currentData())
+        font = load_font(self.font_combo.currentData(), params['font_size'])
+        return paginate_content(content, background.size, params, font)
+
+    def show_current_preview_page(self):
+        if not self.preview_pages:
+            self.page_label.setText('第 0 页 / 共 0 页')
+            return
+
+        params = self.get_current_params()
+        params['page_layout'] = self.preview_pages[self.current_preview_page]
+        self.preview.update_preview(
+            background_path=self.bg_combo.currentData(),
+            font_path=self.font_combo.currentData(),
+            params=params
+        )
+        self.page_label.setText(f'第 {self.current_preview_page + 1} 页 / 共 {len(self.preview_pages)} 页')
+
+    def get_current_params(self):
+        return {
+            'font_size': self.font_size_spin.value(),
+            'line_spacing': self.line_spacing_spin.value(),
+            'word_spacing': self.word_spacing_spin.value(),
+            'left_margin': self.left_margin_spin.value(),
+            'right_margin': self.right_margin_spin.value(),
+            'top_margin': self.top_margin_spin.value(),
+            'bottom_margin': self.bottom_margin_spin.value(),
+            'perturb_x_sigma': self.perturb_x_spin.value(),
+            'perturb_y_sigma': self.perturb_y_spin.value(),
+            'perturb_theta_sigma': 0.05,
+            'word_spacing_sigma': 2,
+            'line_spacing_sigma': 0,
+        }
+
 def main():
     import sys
     app = QApplication(sys.argv)
